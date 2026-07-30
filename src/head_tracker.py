@@ -34,7 +34,6 @@ class HeadTracker:
         self._smoother: Smoother | None = None
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
-        self._done_event = threading.Event()
         self._running = False
         self._face_detected = False
         self._latest_frame: np.ndarray | None = None
@@ -44,12 +43,8 @@ class HeadTracker:
         self._obs_lock = threading.Lock()
         self._timer_item_id: int | None = None
         self._webcam_item_id: int | None = None
-        self._webcam_transform_cache = None
-        self._webcam_transform_cache_scene = ""
-        self._webcam_transform_cache_item_id = 0
-        self._current_rotation: float = 0.0
-        self._base_scale_x: float | None = None
-        self._base_scale_y: float | None = None
+        self._webcam_transform_cache: SceneItemTransform | None = None
+        self._current_rotation = 0.0
         self._saved_transform: SceneItemTransform | None = None
 
     @property
@@ -78,29 +73,25 @@ class HeadTracker:
         self.config = config
 
     def start(self):
+        if self._thread and self._thread.is_alive():
+            raise RuntimeError("Previous tracking thread is still stopping")
         if self._running:
             return
 
         log.info("Starting head tracker")
-
         self._stop_event.clear()
-        self._done_event.clear()
         self._resolve_source_ids()
 
         if self._timer_item_id is None:
-            raise RuntimeError(
-                f"Source '{self.config.timer_source_name}' not found"
-            )
+            raise RuntimeError(f"Source '{self.config.timer_source_name}' not found")
 
         if self._webcam_item_id is None:
             log.warning(
-                "Webcam source '%s' not found in scene '%s' — "
-                "screenshot fetch may fail",
+                "Webcam source '%s' not found in scene '%s' — screenshot fetch may fail",
                 self.config.camera_source_name,
                 self.config.scene_name,
             )
 
-        log.debug("Creating face detector")
         self._detector = FaceDetector()
         self._mapper = CoordinateMapper(
             canvas_width=self.obs.canvas_width,
@@ -109,100 +100,96 @@ class HeadTracker:
         self._smoother = Smoother(alpha=self.config.smoothing_alpha)
         self._webcam_transform_cache = None
         self._current_rotation = 0.0
-        self._base_scale_x = None
-        self._base_scale_y = None
-        self._saved_transform = None
 
-        log.debug("Saving current timer widget transform")
         with self._obs_lock:
             self._saved_transform = self.obs.get_scene_item_transform(
-                self.config.scene_name, self._timer_item_id
+                self.config.scene_name,
+                self._timer_item_id,
             )
-            if self._saved_transform:
-                log.debug(
-                    "Saved transform: pos=(%.1f, %.1f) scale=(%.2f, %.2f) rot=%.1f",
-                    self._saved_transform.pos_x,
-                    self._saved_transform.pos_y,
-                    self._saved_transform.scale_x,
-                    self._saved_transform.scale_y,
-                    self._saved_transform.rotation,
-                )
+        if self._saved_transform is None:
+            raise RuntimeError("Could not read timer source transform from OBS")
 
-        self._thread = threading.Thread(target=self._track_loop, daemon=True)
-        self._thread.start()
         self._running = True
-        log.info("Head tracker started — thread running")
+        self._thread = threading.Thread(
+            target=self._track_loop,
+            name="mistertimer-head-tracker",
+            daemon=True,
+        )
+        self._thread.start()
+        log.info("Head tracker started")
 
-    def stop(self):
+    def stop(self, timeout: float = 3.0):
+        thread = self._thread
+        if thread is None and not self._running:
+            return
+
         log.info("Stopping head tracker")
         self._stop_event.set()
+        if thread and thread is not threading.current_thread():
+            thread.join(timeout=timeout)
+            if thread.is_alive():
+                log.warning("Tracking thread did not stop within %.1f seconds", timeout)
+                return
+
         self._running = False
-        self._done_event.wait(timeout=0.5)
-
-        if self._saved_transform is not None and self._timer_item_id is not None:
-            t = self._saved_transform
-            log.debug("Restoring original timer widget transform")
-            with self._obs_lock:
-                self.obs.set_scene_item_transform(
-                    self.config.scene_name,
-                    self._timer_item_id,
-                    pos_x=t.pos_x,
-                    pos_y=t.pos_y,
-                    rotation=t.rotation,
-                    scale_x=t.scale_x,
-                    scale_y=t.scale_y,
-                )
-
+        self._thread = None
+        self._restore_timer_transform()
         self._webcam_transform_cache = None
         log.info("Head tracker stopped")
+
+    def _restore_timer_transform(self):
+        if self._saved_transform is None or self._timer_item_id is None:
+            return
+        transform = self._saved_transform
+        with self._obs_lock:
+            self.obs.set_scene_item_transform(
+                self.config.scene_name,
+                self._timer_item_id,
+                pos_x=transform.pos_x,
+                pos_y=transform.pos_y,
+                rotation=transform.rotation,
+                scale_x=transform.scale_x,
+                scale_y=transform.scale_y,
+                base_transform=transform,
+            )
 
     def _resolve_source_ids(self):
         with self._obs_lock:
             self._timer_item_id = self.obs.get_scene_item_id_by_name(
-                self.config.scene_name, self.config.timer_source_name
+                self.config.scene_name,
+                self.config.timer_source_name,
             )
             self._webcam_item_id = self.obs.get_scene_item_id_by_name(
-                self.config.scene_name, self.config.camera_source_name
+                self.config.scene_name,
+                self.config.camera_source_name,
             )
-        log.debug(
-            "Resolved source IDs: timer=%s, webcam=%s",
-            self._timer_item_id,
-            self._webcam_item_id,
-        )
 
-    def _get_cached_webcam_transform(self) -> SceneItemTransform | None:
+    def _refresh_webcam_transform(self) -> SceneItemTransform | None:
         if self._webcam_item_id is None:
             return None
-
-        if (self._webcam_transform_cache
-                and self._webcam_transform_cache_scene == self.config.scene_name
-                and self._webcam_transform_cache_item_id == self._webcam_item_id):
-            return self._webcam_transform_cache
-
         with self._obs_lock:
             transform = self.obs.get_scene_item_transform(
-                self.config.scene_name, self._webcam_item_id
+                self.config.scene_name,
+                self._webcam_item_id,
             )
-
         if transform is not None:
             self._webcam_transform_cache = transform
-            self._webcam_transform_cache_scene = self.config.scene_name
-            self._webcam_transform_cache_item_id = self._webcam_item_id
-
-        return transform
+        return self._webcam_transform_cache
 
     def _fetch_frame(self) -> np.ndarray | None:
         with self._obs_lock:
-            b64_str = self.obs.get_source_screenshot(
+            image_data = self.obs.get_source_screenshot(
                 self.config.camera_source_name
             )
-        if not b64_str:
+        if not image_data:
             return None
         try:
-            b64_str = b64_str.partition(",")[-1] if "," in b64_str else b64_str
-            data = base64.b64decode(b64_str)
-            arr = np.frombuffer(data, dtype=np.uint8)
-            frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            payload = image_data.partition(",")[-1]
+            encoded = base64.b64decode(payload, validate=True)
+            frame = cv2.imdecode(
+                np.frombuffer(encoded, dtype=np.uint8),
+                cv2.IMREAD_COLOR,
+            )
             if frame is None:
                 log.debug("cv2.imdecode returned None")
             return frame
@@ -212,116 +199,111 @@ class HeadTracker:
 
     def _track_loop(self):
         frame_count = 0
-        last_fps_time = time.time()
-        last_transform_refresh = time.time()
-        _frame_fail_logged = False
-        _no_face_logged = False
+        last_fps_time = time.monotonic()
+        last_transform_refresh = 0.0
+        frame_fail_logged = False
+        no_face_logged = False
 
-        log.debug("Tracking loop started")
-        while not self._stop_event.is_set():
-            if self._detector is None or self._mapper is None or self._smoother is None:
-                break
+        try:
+            while not self._stop_event.is_set():
+                detector = self._detector
+                mapper = self._mapper
+                smoother = self._smoother
+                if detector is None or mapper is None or smoother is None:
+                    break
 
-            frame = self._fetch_frame()
-            if frame is None:
-                if not _frame_fail_logged:
-                    log.warning(
-                        "Cannot fetch screenshot from source '%s' — "
-                        "check OBS connection and camera source name",
-                        self.config.camera_source_name,
-                    )
-                    _frame_fail_logged = True
-                time.sleep(0.5)
-                continue
-            _frame_fail_logged = False
+                frame = self._fetch_frame()
+                if frame is None:
+                    if not frame_fail_logged:
+                        log.warning(
+                            "Cannot fetch screenshot from source '%s'",
+                            self.config.camera_source_name,
+                        )
+                        frame_fail_logged = True
+                    self._stop_event.wait(0.5)
+                    continue
+                frame_fail_logged = False
 
-            forehead_data = self._detector.detect(frame)
+                forehead = detector.detect(frame)
+                if forehead is None:
+                    if not no_face_logged:
+                        log.info("No face detected in frame — waiting for face")
+                        no_face_logged = True
+                    with self._lock:
+                        self._face_detected = False
+                    frame_count += 1
+                    elapsed = time.monotonic() - last_fps_time
+                    if elapsed >= 1.0:
+                        self._fps = frame_count / elapsed
+                        frame_count = 0
+                        last_fps_time = time.monotonic()
+                    self._stop_event.wait(0.002)
+                    continue
 
-            with self._lock:
-                if forehead_data is not None:
-                    if _no_face_logged:
-                        log.info("Face detected")
-                    _no_face_logged = False
+                if no_face_logged:
+                    log.info("Face detected")
+                no_face_logged = False
 
-                    self._latest_frame = forehead_data.frame.copy()
-                    self._latest_forehead = forehead_data
+                now = time.monotonic()
+                if (
+                    self._webcam_transform_cache is None
+                    or now - last_transform_refresh >= 5.0
+                ):
+                    transform = self._refresh_webcam_transform()
+                    last_transform_refresh = now
+                    if transform:
+                        mapper.update_webcam_transform(transform)
+
+                canvas_coords = mapper.map_to_canvas(
+                    forehead.x,
+                    forehead.y,
+                    forehead.frame_width,
+                    forehead.frame_height,
+                )
+
+                with self._lock:
+                    self._latest_frame = forehead.frame.copy()
+                    self._latest_forehead = forehead
                     self._face_detected = True
 
-                    transform = None
-                    if time.time() - last_transform_refresh > 5.0:
-                        transform = self._get_cached_webcam_transform()
-                        last_transform_refresh = time.time()
-                    elif self._webcam_transform_cache is None:
-                        transform = self._get_cached_webcam_transform()
-                    else:
-                        transform = self._webcam_transform_cache
+                if canvas_coords and self._timer_item_id is not None:
+                    canvas_x, canvas_y = canvas_coords
+                    canvas_y -= self.config.offset_y
+                    canvas_x, canvas_y = smoother.smooth_position(canvas_x, canvas_y)
 
-                    if transform:
-                        self._mapper.update_webcam_transform(transform)
+                    if self.config.rotation_enabled:
+                        self._current_rotation = smoother.smooth_angle(forehead.roll)
 
-                    canvas_coords = self._mapper.map_to_canvas(
-                        forehead_data.x,
-                        forehead_data.y,
-                        forehead_data.frame_width,
-                        forehead_data.frame_height,
-                    )
+                    base = self._saved_transform
+                    if base is not None:
+                        perspective_sx = max(0.1, 1.0 - abs(forehead.yaw) * 0.005)
+                        perspective_sy = max(0.1, 1.0 - abs(forehead.pitch) * 0.005)
+                        with self._obs_lock:
+                            self.obs.set_scene_item_transform(
+                                self.config.scene_name,
+                                self._timer_item_id,
+                                canvas_x,
+                                canvas_y,
+                                rotation=self._current_rotation,
+                                scale_x=base.scale_x * perspective_sx,
+                                scale_y=base.scale_y * perspective_sy,
+                                base_transform=base,
+                            )
 
-                    if canvas_coords:
-                        canvas_x, canvas_y = canvas_coords
-                        canvas_y -= self.config.offset_y
+                frame_count += 1
+                elapsed = now - last_fps_time
+                if elapsed >= 1.0:
+                    self._fps = frame_count / elapsed
+                    frame_count = 0
+                    last_fps_time = now
 
-                        canvas_x, canvas_y = self._smoother.smooth_position(canvas_x, canvas_y)
-
-                        if self.config.rotation_enabled:
-                            self._current_rotation = self._smoother.smooth_angle(forehead_data.roll)
-
-                        perspective_sx = 1.0 - abs(forehead_data.yaw) * 0.005
-                        perspective_sy = 1.0 - abs(forehead_data.pitch) * 0.005
-
-                        if self._timer_item_id is not None:
-                            if self._base_scale_x is None:
-                                with self._obs_lock:
-                                    base = self.obs.get_scene_item_transform(
-                                        self.config.scene_name, self._timer_item_id
-                                    )
-                                if base:
-                                    self._base_scale_x = base.scale_x
-                                    self._base_scale_y = base.scale_y
-
-                            sx = (self._base_scale_x or 1.0) * perspective_sx
-                            sy = (self._base_scale_y or 1.0) * perspective_sy
-
-                            with self._obs_lock:
-                                self.obs.set_scene_item_transform(
-                                    self.config.scene_name,
-                                    self._timer_item_id,
-                                    canvas_x,
-                                    canvas_y,
-                                    rotation=self._current_rotation,
-                                    scale_x=sx,
-                                    scale_y=sy,
-                                )
-                    else:
-                        log.debug("canvas_coords is None — mapper returned no result")
-                else:
-                    if not _no_face_logged:
-                        log.info("No face detected in frame — waiting for face")
-                        _no_face_logged = True
-                    self._face_detected = False
-
-            frame_count += 1
-            now = time.time()
-            elapsed = now - last_fps_time
-            if elapsed >= 1.0:
-                self._fps = frame_count / elapsed
-                frame_count = 0
-                last_fps_time = now
-
-            time.sleep(0.002)
-
-        if self._detector:
-            self._detector.release()
+                self._stop_event.wait(0.002)
+        except Exception:
+            log.exception("Tracking loop crashed")
+        finally:
+            detector = self._detector
             self._detector = None
-
-        log.debug("Tracking loop ended")
-        self._done_event.set()
+            if detector is not None:
+                detector.release()
+            self._running = False
+            log.debug("Tracking loop ended")
