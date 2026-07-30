@@ -29,32 +29,11 @@ def main():
     parser = argparse.ArgumentParser(
         description="MisterTimer — pin OBS widget to streamer's forehead"
     )
-    parser.add_argument(
-        "--host",
-        default="127.0.0.1",
-        help="UI host (default: 127.0.0.1)",
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=8080,
-        help="UI port (default: 8080)",
-    )
-    parser.add_argument(
-        "--no-browser",
-        action="store_true",
-        help="Don't open browser automatically",
-    )
-    parser.add_argument(
-        "--public",
-        action="store_true",
-        help="Listen on all interfaces (0.0.0.0)",
-    )
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="Enable debug logging",
-    )
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument("--no-browser", action="store_true")
+    parser.add_argument("--public", action="store_true")
+    parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
     setup_logging(debug=args.debug)
@@ -66,18 +45,28 @@ def main():
             sys.stderr = open(os.devnull, "w")
 
     host = "0.0.0.0" if args.public else args.host
-
     log.info("MisterTimer starting on %s:%s", host, args.port)
 
-    app = HeadTimerUI()
-    start_tray()
-    app.run(host=host, port=args.port, show=not args.no_browser)
+    application = HeadTimerUI()
+    start_tray(args.port, application)
+    try:
+        application.run(host=host, port=args.port, show=not args.no_browser)
+    finally:
+        shutdown(application)
 
 
-def start_tray():
+def shutdown(application: HeadTimerUI):
+    try:
+        application.tracker.stop()
+    finally:
+        application.obs.disconnect()
+
+
+def start_tray(port: int, application: HeadTimerUI):
     try:
         from ui.tray import setup_tray
-        setup_tray()
+
+        setup_tray(port=port, on_quit=lambda: shutdown(application))
         log.debug("System tray icon started")
     except Exception:
         log.debug("System tray not available", exc_info=True)
