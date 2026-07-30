@@ -76,8 +76,8 @@ class OBSConnector:
                 self._canvas_height,
             )
             return True
-        except Exception as e:
-            log.warning("Failed to connect to OBS: %s", e)
+        except Exception as exc:
+            log.warning("Failed to connect to OBS: %s", exc)
             self._client = None
             return False
 
@@ -86,7 +86,7 @@ class OBSConnector:
             try:
                 self._client.disconnect()
             except Exception:
-                pass
+                log.debug("OBS disconnect failed", exc_info=True)
             self._client = None
             log.info("Disconnected from OBS")
 
@@ -95,16 +95,15 @@ class OBSConnector:
             return []
         try:
             resp = self._client.send("GetSceneList")
-            scenes = []
-            for s in resp.scenes:
-                scenes.append(SceneInfo(
-                    name=s.get("sceneName", ""),
-                    index=s.get("sceneIndex", 0),
-                ))
-            log.debug("Got %d scenes", len(scenes))
-            return scenes
-        except Exception as e:
-            log.error("Failed to get scene list: %s", e)
+            return [
+                SceneInfo(
+                    name=scene.get("sceneName", ""),
+                    index=scene.get("sceneIndex", 0),
+                )
+                for scene in resp.scenes
+            ]
+        except Exception as exc:
+            log.error("Failed to get scene list: %s", exc)
             return []
 
     def get_scene_items(self, scene_name: str) -> list[SceneItemInfo]:
@@ -112,23 +111,21 @@ class OBSConnector:
             return []
         try:
             resp = self._client.send("GetSceneItemList", {"sceneName": scene_name})
-            items = []
-            for item in resp.scene_items:
-                items.append(SceneItemInfo(
+            return [
+                SceneItemInfo(
                     id=item["sceneItemId"],
                     name=item.get("sourceName", ""),
                     type=item.get("inputKind", ""),
                     index=item.get("sceneItemIndex", 0),
-                ))
-            log.debug("Got %d items for scene '%s'", len(items), scene_name)
-            return items
-        except Exception as e:
-            log.error("Failed to get items for scene '%s': %s", scene_name, e)
+                )
+                for item in resp.scene_items
+            ]
+        except Exception as exc:
+            log.error("Failed to get items for scene '%s': %s", scene_name, exc)
             return []
 
     def get_scene_item_id_by_name(self, scene_name: str, source_name: str) -> int | None:
-        items = self.get_scene_items(scene_name)
-        for item in items:
+        for item in self.get_scene_items(scene_name):
             if item.name == source_name:
                 return item.id
         return None
@@ -139,10 +136,10 @@ class OBSConnector:
         if not self._client:
             return None
         try:
-            resp = self._client.send("GetSceneItemTransform", {
-                "sceneName": scene_name,
-                "sceneItemId": item_id,
-            })
+            resp = self._client.send(
+                "GetSceneItemTransform",
+                {"sceneName": scene_name, "sceneItemId": item_id},
+            )
             t = resp.scene_item_transform
             return SceneItemTransform(
                 pos_x=t.get("positionX", 0.0),
@@ -160,7 +157,13 @@ class OBSConnector:
                 crop_bottom=t.get("cropBottom", 0),
                 alignment=t.get("alignment", 5),
             )
-        except Exception:
+        except Exception as exc:
+            log.error(
+                "Failed to get transform for item %s in scene '%s': %s",
+                item_id,
+                scene_name,
+                exc,
+            )
             return None
 
     def set_scene_item_transform(
@@ -173,52 +176,45 @@ class OBSConnector:
         scale_x: float | None = None,
         scale_y: float | None = None,
         base_transform: SceneItemTransform | None = None,
-    ):
+    ) -> bool:
         if not self._client:
-            return
+            return False
 
         current = base_transform or self.get_scene_item_transform(scene_name, item_id)
         if current is None:
-            return
-
-        sx = float(current.scale_x if scale_x is None else scale_x)
-        sy = float(current.scale_y if scale_y is None else scale_y)
-
-        w = float(max(current.source_width * sx, 1.0))
-        h = float(max(current.source_height * sy, 1.0))
+            return False
 
         transform_data = {
             "positionX": float(pos_x),
             "positionY": float(pos_y),
             "rotation": float(rotation),
-            "scaleX": sx,
-            "scaleY": sy,
-            "alignment": 0,
-            "boundsType": "OBS_BOUNDS_NONE",
-            "boundsAlignment": 0,
-            "boundsWidth": w,
-            "boundsHeight": h,
+            "scaleX": float(current.scale_x if scale_x is None else scale_x),
+            "scaleY": float(current.scale_y if scale_y is None else scale_y),
+            "alignment": int(current.alignment),
             "cropLeft": int(current.crop_left),
             "cropRight": int(current.crop_right),
             "cropTop": int(current.crop_top),
             "cropBottom": int(current.crop_bottom),
-            "sourceWidth": float(max(current.source_width, 1.0)),
-            "sourceHeight": float(max(current.source_height, 1.0)),
-            "width": w,
-            "height": h,
         }
 
         try:
-            self._client.send("SetSceneItemTransform", {
-                "sceneName": scene_name,
-                "sceneItemId": item_id,
-                "sceneItemTransform": transform_data,
-            })
-        except Exception as e:
+            self._client.send(
+                "SetSceneItemTransform",
+                {
+                    "sceneName": scene_name,
+                    "sceneItemId": item_id,
+                    "sceneItemTransform": transform_data,
+                },
+            )
+            return True
+        except Exception as exc:
             log.error(
                 "Failed to set transform for item %s in scene '%s': %s",
-                item_id, scene_name, e,
+                item_id,
+                scene_name,
+                exc,
             )
+            return False
 
     async def _run_sync(self, func, *args, **kwargs):
         loop = asyncio.get_running_loop()
@@ -239,23 +235,27 @@ class OBSConnector:
         return await self._run_sync(self.connect)
 
     def get_source_screenshot(
-        self, source_name: str, width: int = 640, height: int = 360, quality: int = 80
+        self,
+        source_name: str,
+        width: int = 640,
+        height: int = 360,
+        quality: int = 80,
     ) -> str | None:
         if not self._client:
             log.debug("get_source_screenshot: not connected to OBS")
             return None
         try:
-            resp = self._client.send("GetSourceScreenshot", {
-                "sourceName": source_name,
-                "imageFormat": "jpg",
-                "imageWidth": width,
-                "imageHeight": height,
-                "imageCompressionQuality": quality,
-            })
-            return resp.image_data
-        except Exception as e:
-            log.error(
-                "Failed to get screenshot for source '%s': %s",
-                source_name, e,
+            resp = self._client.send(
+                "GetSourceScreenshot",
+                {
+                    "sourceName": source_name,
+                    "imageFormat": "jpg",
+                    "imageWidth": width,
+                    "imageHeight": height,
+                    "imageCompressionQuality": quality,
+                },
             )
+            return resp.image_data
+        except Exception as exc:
+            log.error("Failed to get screenshot for source '%s': %s", source_name, exc)
             return None
